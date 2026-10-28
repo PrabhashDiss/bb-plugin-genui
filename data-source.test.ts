@@ -67,6 +67,29 @@ describe("loadThreadFile", () => {
     expect(await loadThreadFile(bb, "thr_1", "/tmpfoo/x.json")).toMatchObject({ ok: false });
   });
 
+  it("reads storage of threads the thread spawned, and nothing else", async () => {
+    const parents: Record<string, string | null> = { thr_1: null, thr_child: "thr_1", thr_grand: "thr_child", thr_other: "thr_9", thr_9: null };
+    const storage = (id: string) => `/home/u/.bb/thread-storage/${id}`;
+    const files = {
+      [`${storage("thr_child")}/a.png`]: "1",
+      [`${storage("thr_grand")}/b.png`]: "2",
+      [`${storage("thr_other")}/c.png`]: "3",
+    };
+    const bb = fakeBb(files);
+    Object.assign(bb.sdk.threads, {
+      get: async ({ threadId }: { threadId: string }) => {
+        if (!(threadId in parents)) throw new Error("not found");
+        return { id: threadId, parentThreadId: parents[threadId], environment: { id: "e", path: WORKSPACE, hostId: "host_1" } };
+      },
+      storageLocation: async ({ threadId }: { threadId: string }) => ({ storageRootPath: storage(threadId), hostId: "host_1" }),
+    });
+    expect(await loadThreadFile(bb, "thr_1", `${storage("thr_child")}/a.png`)).toMatchObject({ ok: true });
+    expect(await loadThreadFile(bb, "thr_1", `${storage("thr_grand")}/b.png`)).toMatchObject({ ok: true });
+    expect(await loadThreadFile(bb, "thr_1", `${storage("thr_other")}/c.png`)).toMatchObject({ ok: false });
+    expect(await loadThreadFile(bb, "thr_1", `${storage("thr_unknown")}/c.png`)).toMatchObject({ ok: false });
+    expect(await loadThreadFile(bb, "thr_1", `${storage("thr_child")}/../thr_other/c.png`)).toMatchObject({ ok: false });
+  });
+
   it("refuses paths that climb out of their root", async () => {
     const reads: string[] = [];
     const bb = fakeBb({ "/work/secrets.json": "{}" }, reads);

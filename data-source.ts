@@ -1,7 +1,8 @@
 // Loads the files a spec references with Load(path) and Snippet(path), and
 // the images Image(path) shows, so the model points at files instead of
-// retyping them. Only the thread's own workspace, its thread storage and the
-// host's /tmp (where agents and their tools write screenshots and reports)
+// retyping them. Only the thread's own workspace, its thread storage, the
+// thread storage of threads it spawned (a coordinator shows its workers'
+// screenshots) and the host's /tmp (where agents and their tools write screenshots and reports)
 // are readable: a spec is model output and must not reach arbitrary files on
 // the host. Gallery specs (gallery/*.ui in this plugin) read from gallery/ only.
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -109,7 +110,36 @@ async function threadRoots(bb: BbPluginApi, threadId: string): Promise<{ workspa
   };
 }
 
-/** Reads one file of the thread's workspace, thread storage or /tmp; failures are values, never throws. */
+const THREAD_ID_IN_PATH = /(?:^|\/)(thr_[A-Za-z0-9]+)(?:\/|$)/;
+const MAX_ANCESTOR_DEPTH = 32;
+
+/**
+ * The storage of a thread below `threadId`, when `target` is a path inside it.
+ * The thread id comes from the path, but the read is allowed only after BB
+ * confirms `threadId` is an ancestor and that the path is inside the storage
+ * root BB reports for that thread, so a spec cannot reach unrelated threads.
+ */
+async function descendantStorage(bb: BbPluginApi, threadId: string, target: string): Promise<Attempt[]> {
+  const candidate = THREAD_ID_IN_PATH.exec(target)?.[1];
+  if (candidate === undefined || candidate === threadId) return [];
+  try {
+    let current: string | null = candidate;
+    for (let depth = 0; current !== null && depth < MAX_ANCESTOR_DEPTH; depth++) {
+      const thread: { parentThreadId?: string | null } = await bb.sdk.threads.get({ threadId: current });
+      current = thread.parentThreadId ?? null;
+      if (current === threadId) {
+        const storage = await bb.sdk.threads.storageLocation({ threadId: candidate });
+        const root = { path: storage.storageRootPath, hostId: storage.hostId };
+        return contains(root.path, target) ? [{ root, target }] : [];
+      }
+    }
+  } catch {
+    // An unknown thread or one the plugin cannot see is not a descendant.
+  }
+  return [];
+}
+
+/** Reads one file of the thread's workspace, its thread storage, a descendant thread's storage or /tmp; failures are values, never throws. */
 async function readThreadFile(bb: BbPluginApi, threadId: string, requested: string, maxBytes: number): Promise<FileContent> {
   let roots: { workspace: Root | null; storage: Root | null };
   try {
@@ -131,12 +161,13 @@ async function readThreadFile(bb: BbPluginApi, threadId: string, requested: stri
     const hostId = roots.workspace?.hostId ?? roots.storage?.hostId;
     attempts = [...inside(roots.storage, target), ...inside(roots.workspace, target)].slice(0, 1);
     if (attempts.length === 0 && hostId !== undefined) attempts = tempAttempts(target, hostId);
+    if (attempts.length === 0) attempts = await descendantStorage(bb, threadId, target);
   } else {
     const root = roots.workspace;
     attempts = root === null ? [] : inside(root, path.resolve(root.path, requested));
   }
   if (attempts.length === 0) {
-    return { ok: false, error: "only files in this thread's workspace, its thread storage or /tmp can be loaded" };
+    return { ok: false, error: "only files in this thread's workspace, its thread storage, a thread it spawned or /tmp can be loaded" };
   }
   let first: FileContent | undefined;
   for (const attempt of attempts) {
